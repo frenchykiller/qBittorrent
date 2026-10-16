@@ -61,6 +61,7 @@
 #include "api/apierror.h"
 #include "api/appcontroller.h"
 #include "api/authcontroller.h"
+#include "oidcauthenticator.h"
 #include "api/clientdatacontroller.h"
 #include "api/logcontroller.h"
 #include "api/rsscontroller.h"
@@ -173,12 +174,16 @@ WebApplication::WebApplication(IApplication *app, QObject *parent)
     : ApplicationComponent(app, parent)
     , m_cacheID {QString::number(Utils::Random::rand(), 36)}
     , m_trRegex {u"QBT_TR\\((([^\\)]|\\)(?!QBT_TR))+)\\)QBT_TR\\[CONTEXT=([a-zA-Z_][a-zA-Z0-9_]*)\\]"_s}
-    , m_authController {new AuthController(this, app, this)}
+    , m_oidcAuthenticator {std::make_unique<OidcAuthenticator>(this)}
+    , m_authController {new AuthController(this, m_oidcAuthenticator.get(), app, this)}
     , m_torrentCreationManager {new BitTorrent::TorrentCreationManager(app, this)}
     , m_searchJobManager {new SearchJobManager(this)}
     , m_clientDataStorage {new ClientDataStorage(this)}
 {
     declarePublicAPI(u"auth/login"_s);
+    declarePublicAPI(u"auth/oidcConfig"_s);
+    declarePublicAPI(u"auth/oidcLogin"_s);
+    declarePublicAPI(u"auth/oidcCallback"_s);
 
     configure();
     connect(Preferences::instance(), &Preferences::changed, this, &WebApplication::configure);
@@ -698,7 +703,10 @@ void WebApplication::processRequest(const Http::Request &request, const Http::En
         // block suspicious requests
         // CSRF check is skipped for the webroot so that cross-origin hyperlinks to
         // the WebUI succeed; the root document is static and has no side effects.
-        const bool isWebRoot = (request.path == u"/") || (request.path == INDEX_HTML);
+        // OIDC login and callback routes are also exempted as top-level browser navigations.
+        const bool isOidcNavEndpoint = (request.path == (API_PATH + u"auth/oidcLogin"_s))
+            || (request.path == (API_PATH + u"auth/oidcCallback"_s));
+        const bool isWebRoot = (request.path == u"/") || (request.path == INDEX_HTML) || isOidcNavEndpoint;
         if ((!isUsingApiKey && m_isCSRFProtectionEnabled && !isWebRoot && isCrossSiteRequest(m_request))
             || (m_isHostHeaderValidationEnabled && !validateHostHeader()))
         {
@@ -725,6 +733,17 @@ void WebApplication::processRequest(const Http::Request &request, const Http::En
 
             if (isUsingApiKey && (endpoint.startsWith(u"auth/")))
                 throw ForbiddenHTTPError();
+
+            if (endpoint == u"auth/oidcLogin"_s)
+            {
+                processOidcLogin(commonHeaders, responseWriter);
+                return;
+            }
+            if (endpoint == u"auth/oidcCallback"_s)
+            {
+                processOidcCallback(commonHeaders, responseWriter);
+                return;
+            }
 
             processAPIRequest(endpoint, commonHeaders, responseWriter);
         }
@@ -1158,3 +1177,90 @@ void WebApplication::increaseFailedAttempts() const
         failedLogin.banTimer.setRemainingTime(Preferences::instance()->getWebUIBanDuration());
     }
 }
+
+void WebApplication::processOidcLogin(const Http::HeaderMap &commonHeaders, Http::ResponseWriter &responseWriter)
+{
+    if (!m_oidcAuthenticator || !m_oidcAuthenticator->isEnabled())
+        throw NotFoundHTTPError();
+
+    QString redirectUri = m_oidcAuthenticator->config().redirectUri;
+    if (redirectUri.isEmpty())
+    {
+        const QString scheme = isOriginTrustworthy() ? u"https"_s : u"http"_s;
+        const QString host = m_isReverseProxySupportEnabled
+            ? m_request.headers.value(Http::HEADER_X_FORWARDED_HOST, m_request.headers.value(Http::HEADER_HOST))
+            : m_request.headers.value(Http::HEADER_HOST);
+        redirectUri = u"%1://%2/api/v2/auth/oidcCallback"_s.arg(scheme, host);
+    }
+
+    const QString authUrl = m_oidcAuthenticator->buildAuthorizationUrl(redirectUri);
+    if (authUrl.isEmpty())
+    {
+        LogMsg(tr("OIDC: Failed to generate authorization URL."), Log::WARNING);
+        throw InternalServerErrorHTTPError(tr("Failed to initiate OIDC login."));
+    }
+
+    Http::Response response {.status = {.code = 302, .text = u"Found"_s}, .headers = commonHeaders};
+    response.headers.insert(Http::HEADER_LOCATION, authUrl);
+    responseWriter.setResponse(response);
+}
+
+void WebApplication::processOidcCallback(const Http::HeaderMap &commonHeaders, Http::ResponseWriter &responseWriter)
+{
+    if (!m_oidcAuthenticator || !m_oidcAuthenticator->isEnabled())
+        throw NotFoundHTTPError();
+
+    const QString code = QString::fromUtf8(m_request.query.value(u"code"_s));
+    const QString state = QString::fromUtf8(m_request.query.value(u"state"_s));
+    const QString error = QString::fromUtf8(m_request.query.value(u"error"_s));
+    const QString errorDesc = QString::fromUtf8(m_request.query.value(u"error_description"_s));
+
+    if (!error.isEmpty())
+    {
+        LogMsg(tr("OIDC: Provider returned error: %1 (%2)").arg(error, errorDesc), Log::WARNING);
+        Http::Response response {.status = {.code = 302, .text = u"Found"_s}, .headers = commonHeaders};
+        const QString errStr = errorDesc.isEmpty() ? error : errorDesc;
+        response.headers.insert(Http::HEADER_LOCATION, u"/?oidc_error=%1"_s.arg(QString::fromUtf8(QUrl::toPercentEncoding(errStr))));
+        responseWriter.setResponse(response);
+        return;
+    }
+
+    if (code.isEmpty() || state.isEmpty())
+    {
+        LogMsg(tr("OIDC: Callback missing code or state parameter."), Log::WARNING);
+        Http::Response response {.status = {.code = 302, .text = u"Found"_s}, .headers = commonHeaders};
+        response.headers.insert(Http::HEADER_LOCATION, u"/?oidc_error=%1"_s.arg(QString::fromUtf8(QUrl::toPercentEncoding(u"Missing code or state"_s))));
+        responseWriter.setResponse(response);
+        return;
+    }
+
+    QString redirectUri = m_oidcAuthenticator->config().redirectUri;
+    if (redirectUri.isEmpty())
+    {
+        const QString scheme = isOriginTrustworthy() ? u"https"_s : u"http"_s;
+        const QString host = m_isReverseProxySupportEnabled
+            ? m_request.headers.value(Http::HEADER_X_FORWARDED_HOST, m_request.headers.value(Http::HEADER_HOST))
+            : m_request.headers.value(Http::HEADER_HOST);
+        redirectUri = u"%1://%2/api/v2/auth/oidcCallback"_s.arg(scheme, host);
+    }
+
+    const auto tokenResult = m_oidcAuthenticator->exchangeCodeAndVerify(code, state, redirectUri);
+    if (!tokenResult.success)
+    {
+        LogMsg(tr("OIDC: Login failed: %1").arg(tokenResult.error), Log::WARNING);
+        Http::Response response {.status = {.code = 302, .text = u"Found"_s}, .headers = commonHeaders};
+        response.headers.insert(Http::HEADER_LOCATION, u"/?oidc_error=%1"_s.arg(QString::fromUtf8(QUrl::toPercentEncoding(tokenResult.error))));
+        responseWriter.setResponse(response);
+        return;
+    }
+
+    // Successfully verified! Create authenticated session
+    sessionStart();
+
+    Http::Response response {.status = {.code = 302, .text = u"Found"_s}, .headers = commonHeaders};
+    setSessionCookie(response.headers);
+    response.headers.insert(Http::HEADER_LOCATION, u"/"_s);
+    responseWriter.setResponse(response);
+    LogMsg(tr("OIDC: Successfully authenticated user '%1'").arg(tokenResult.username), Log::INFO);
+}
+

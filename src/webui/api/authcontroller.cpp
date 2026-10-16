@@ -28,15 +28,19 @@
 
 #include "authcontroller.h"
 
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QString>
 
 #include "base/global.h"
 #include "apierror.h"
 #include "isessionmanager.h"
+#include "webui/oidcauthenticator.h"
 
-AuthController::AuthController(ISessionManager *sessionManager, IApplication *app, QObject *parent)
+AuthController::AuthController(ISessionManager *sessionManager, OidcAuthenticator *oidcAuth, IApplication *app, QObject *parent)
     : APIController(app, parent)
     , m_sessionManager {sessionManager}
+    , m_oidcAuth {oidcAuth}
 {
 }
 
@@ -63,4 +67,16 @@ void AuthController::logoutAction()
 {
     m_sessionManager->sessionEnd();
     setResult(QString());
+}
+
+void AuthController::oidcConfigAction()
+{
+    const bool enabled = m_oidcAuth && m_oidcAuth->isEnabled();
+    const QString displayName = (m_oidcAuth && enabled) ? m_oidcAuth->displayName() : u"Login with OIDC"_s;
+
+    QJsonObject obj;
+    obj[u"enabled"_s] = enabled;
+    obj[u"displayName"_s] = displayName;
+
+    setResult(obj);
 }

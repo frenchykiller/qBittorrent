@@ -30,6 +30,7 @@
 #pragma once
 
 #include <chrono>
+#include <memory>
 #include <utility>
 
 #include <QDateTime>
@@ -65,6 +66,7 @@ class QNetworkCookie;
 class APIController;
 class AuthController;
 class ClientDataStorage;
+class OidcAuthenticator;
 class SearchJobManager;
 class WebSession;
 
@@ -101,6 +103,8 @@ private:
     void sessionEnd() override;
 
     void processAPIRequest(const QString &endpoint, const Http::HeaderMap &commonHeaders, Http::ResponseWriter &responseWriter);
+    void processOidcLogin(const Http::HeaderMap &commonHeaders, Http::ResponseWriter &responseWriter);
+    void processOidcCallback(const Http::HeaderMap &commonHeaders, Http::ResponseWriter &responseWriter);
     void configure();
 
     void declarePublicAPI(const QString &apiPath);
@@ -254,6 +258,7 @@ private:
     QTranslator m_translator;
     bool m_translationFileLoaded = false;
 
+    std::unique_ptr<OidcAuthenticator> m_oidcAuthenticator;
     AuthController *m_authController = nullptr;
     bool m_isLocalAuthEnabled = false;
     bool m_isAuthSubnetWhitelistEnabled = false;

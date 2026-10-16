@@ -32,6 +32,7 @@
 
 class QString;
 
+class OidcAuthenticator;
 struct ISessionManager;
 
 class AuthController : public APIController
@@ -40,12 +41,14 @@ class AuthController : public APIController
     Q_DISABLE_COPY_MOVE(AuthController)
 
 public:
-    explicit AuthController(ISessionManager *sessionManager, IApplication *app, QObject *parent = nullptr);
+    explicit AuthController(ISessionManager *sessionManager, OidcAuthenticator *oidcAuth, IApplication *app, QObject *parent = nullptr);
 
 private slots:
     void loginAction();
     void logoutAction();
+    void oidcConfigAction();
 
 private:
     ISessionManager *m_sessionManager = nullptr;
+    OidcAuthenticator *m_oidcAuth = nullptr;
 };

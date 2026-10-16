@@ -60,10 +60,37 @@ const submitLoginForm = () => {
 };
 
 document.addEventListener("DOMContentLoaded", (_event) => {
+    const errorMsgElement = document.getElementById("error_msg");
+    const urlParams = new URLSearchParams(window.location.search);
+    const oidcError = urlParams.get("oidc_error");
+    if (oidcError) {
+        errorMsgElement.textContent = `QBT_TR(OIDC Authentication Error:)QBT_TR[CONTEXT=Login] ${decodeURIComponent(oidcError)}`;
+    }
+
     const loginForm = document.getElementById("loginform");
     loginForm.method = "POST";
     loginForm.addEventListener("submit", (event) => {
         event.preventDefault();
         submitLoginForm();
     });
+
+    fetch("api/v2/auth/oidcConfig")
+        .then(response => (response.ok ? response.json() : null))
+        .then(data => {
+            if (data && data.enabled) {
+                const oidcRow = document.getElementById("oidcRow");
+                const oidcBtn = document.getElementById("oidcLoginButton");
+                if (oidcRow && oidcBtn) {
+                    if (data.displayName)
+                        oidcBtn.value = data.displayName;
+                    oidcRow.style.display = "block";
+                    oidcBtn.addEventListener("click", () => {
+                        window.location.href = "api/v2/auth/oidcLogin";
+                    });
+                }
+            }
+        })
+        .catch(() => {
+            // Silently ignore if OIDC endpoint is unavailable
+        });
 });
